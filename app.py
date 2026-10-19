@@ -5,11 +5,17 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from typing import List
 from inference import FallPredictor
+from analytics import activity_metrics, publish_analytics, prune_analytics
+from pydantic import ConfigDict
+import hmac
+import hashlib
+import json
 
 app = FastAPI(title='Smart Safety Shoe ML Inference')
 model = FallPredictor(str(Path(__file__).with_name('fall_rf_sisfall.joblib')))
 
 class Sample(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
     ax: float
     ay: float
     az: float
@@ -18,7 +24,15 @@ class Sample(BaseModel):
     gz: float
     t: int = Field(ge=0)  # ESP32 millis()
 
+class Location(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+
 class Window(BaseModel):
+    # Optional Unix window end; legacy firmware remains compatible.
+    capturedAt: int | None = Field(default=None, ge=1)
+    location: Location | None = None
     samples: List[Sample] = Field(min_length=150, max_length=150)
 
 @app.get('/health')
@@ -28,7 +42,7 @@ def health():
 @app.post('/predict')
 def predict(payload: Window, x_api_key: str | None = Header(default=None)):
     key = os.environ.get('ML_API_KEY')
-    if not key or x_api_key != key:
+    if not key or not x_api_key or not hmac.compare_digest(x_api_key.encode(), key.encode()):
         raise HTTPException(status_code=401, detail='Unauthorized')
     samples = [s.model_dump() for s in payload.samples]
     times = [s['t'] for s in samples]
@@ -44,15 +58,22 @@ def predict(payload: Window, x_api_key: str | None = Header(default=None)):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     result['timestamp'] = int(time.time() * 1000)
     result['source'] = 'sisfall-rf'
+    metrics = activity_metrics(samples)
+    end = payload.capturedAt or result['timestamp']
+    if abs(end - result['timestamp']) > 60_000:
+        raise HTTPException(status_code=422, detail='capturedAt must be within 60 seconds of server time')
+    start = end - metrics['durationMs']
+    result['activity'] = metrics
     # Publish ML results separately; never overwrite sensorData/fallDetected.
     # Firebase integration is enabled only with valid Admin SDK credentials.
     if os.environ.get('FIREBASE_PROJECT_ID') and os.environ.get('FIREBASE_DATABASE_URL'):
-        publish_prediction(result)
+        publish_prediction(result, metrics, start, end, payload.location.model_dump() if payload.location else None, hashlib.sha256(json.dumps(payload.model_dump(), sort_keys=True).encode()).hexdigest())
     return result
 
 _firebase_db = None
+_last_pruned_day = None
 
-def publish_prediction(result):
+def firebase_database():
     global _firebase_db
     if _firebase_db is None:
         import firebase_admin
@@ -65,8 +86,21 @@ def publish_prediction(result):
         if not firebase_admin._apps:
             firebase_admin.initialize_app(cred, {'databaseURL': os.environ['FIREBASE_DATABASE_URL']})
         _firebase_db = db
+    return _firebase_db
+
+
+def publish_prediction(result, metrics, start, end, location, window_id):
+    db = firebase_database()
     try:
         # Separate node; existing ESP32 sensorData PUTs cannot erase ML results.
-        _firebase_db.reference('mlPrediction').set(result)
+        db.reference('mlPrediction').transaction(lambda old: result if not old or old.get('timestamp', 0) < result['timestamp'] else old)
+        if os.environ.get('ENABLE_ANALYTICS') == 'true':
+            publish_analytics(db, result, metrics, start, end, location, window_id)
+        # Run at most once per UTC day per worker; retries remain safe.
+        global _last_pruned_day
+        day = result['timestamp'] // 86_400_000
+        if os.environ.get('ENABLE_ANALYTICS') == 'true' and day != _last_pruned_day:
+            prune_analytics(db, result['timestamp'])
+            _last_pruned_day = day
     except Exception as exc:
         raise HTTPException(status_code=503, detail='Firebase write failed') from exc
